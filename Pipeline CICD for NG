@@ -1,0 +1,634 @@
+name: 🚀 NG-WLG-PL-CICD-Test
+
+on:
+  # Trigger when changes are pushed to src/solutions
+  push:
+    branches: [main]
+    paths:
+      - 'src/solutions/**'
+
+  # Manual trigger with solution selection
+  workflow_dispatch:
+    inputs:
+      solution-name:
+        description: 'Select specific solution to pack and deploy'
+        required: true
+        type: choice
+        options:
+          - 'nget_wlg_webresources'
+          - 'nget_wlg_core'
+          - 'nget_wlg_securityroles'
+          - 'nget_wlg_dashboards'
+          - 'nget_wlg_dummy'
+          - 'nget_wlg_emailtemplates'
+          - 'nget_wlg_pluginsnflows'
+          - 'nget_wlg_apps'
+          - 'nget_wlg_testdata'
+          - 'nget_wlg_integration'
+      deploy-to-uat:
+        description: 'Also deploy to UAT environment (requires approval)?'
+        required: true
+        type: choice
+        default: 'no'
+        options:
+          - 'yes'
+          - 'no'
+      auto-uat-for-push:
+        description: 'Enable UAT approval for push triggers?'
+        required: false
+        type: choice
+        default: 'no'
+        options:
+          - 'yes'
+          - 'no'
+
+env:
+  ENVIRONMENT_URL_DEV: ${{ secrets.ENVIRONMENT_URL_DEV }}
+  ENVIRONMENT_URL_CICD: ${{ secrets.ENVIRONMENT_URL_CICD }}
+  ENVIRONMENT_URL_TEST: ${{ secrets.ENVIRONMENT_URL_TEST }}
+  ENVIRONMENT_URL_UAT: ${{ secrets.ENVIRONMENT_URL_UAT }}
+  # Control UAT deployment behavior
+  AUTO_UAT_ON_PUSH: 'true'  # Set to 'true' to always trigger UAT approval after TEST, 'false' to require manual trigger
+  CLIENT_ID_DEV: ${{ secrets.CLIENT_ID_DEV }}
+  CLIENT_SECRET_DEV: ${{ secrets.CLIENT_SECRET_DEV }}
+  TENANT_ID_DEV: ${{ secrets.TENANT_ID_DEV }}
+  CLIENT_ID_CICD: ${{ secrets.CLIENT_ID_CICD }}
+  CLIENT_SECRET_CICD: ${{ secrets.CLIENT_SECRET_CICD }}
+  TENANT_ID_CICD: ${{ secrets.TENANT_ID_CICD }}
+  CLIENT_ID_TEST: ${{ secrets.CLIENT_ID_TEST }}
+  CLIENT_SECRET_TEST: ${{ secrets.CLIENT_SECRET_TEST }}
+  TENANT_ID_TEST: ${{ secrets.TENANT_ID_TEST }}
+  CLIENT_ID_UAT: ${{ secrets.CLIENT_ID_UAT }}
+  CLIENT_SECRET_UAT: ${{ secrets.CLIENT_SECRET_UAT }}
+  TENANT_ID_UAT: ${{ secrets.TENANT_ID_UAT }}
+
+jobs:
+  # Job 1: Detect changes (from packing-artifact.yml)
+  detect-changes:
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message, 'Auto-Pipeline') && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      solutions: ${{ steps.changes.outputs.solutions }}
+      has-changes: ${{ steps.changes.outputs.has-changes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq for JSON processing
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Detect changed solutions in src/solutions
+        id: changes
+        shell: bash
+        run: |
+          echo "=== Analyzing src/solutions changes for complete pipeline ==="
+          # Skip automated commits
+          if [[ "${{ github.event.head_commit.message }}" == *"Auto-Pipeline"* ]]; then
+            echo "Skipping automated pipeline commit"
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "solutions=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Get changed files in src/solutions
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep "^src/solutions/" || echo "")
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No changes detected in src/solutions"
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "solutions=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Changed files in src/solutions:"
+          echo "$CHANGED_FILES"
+          # Extract unique solution names from src/solutions path
+          SOLUTIONS=""
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              SOLUTION_NAME=$(echo "$file" | cut -d'/' -f3)
+              if [ -n "$SOLUTION_NAME" ] && [ "$SOLUTION_NAME" != "solutions" ]; then
+                if [ -z "$SOLUTIONS" ]; then
+                  SOLUTIONS="$SOLUTION_NAME"
+                else
+                  if ! echo "$SOLUTIONS" | grep -q "\b$SOLUTION_NAME\b"; then
+                    SOLUTIONS="$SOLUTIONS\n$SOLUTION_NAME"
+                  fi
+                fi
+              fi
+            fi
+          done <<< "$CHANGED_FILES"
+          if [ -z "$SOLUTIONS" ]; then
+            echo "No valid solutions found in src/solutions changes"
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "solutions=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Convert to JSON array using jq
+          SOLUTION_ARRAY=$(echo -e "$SOLUTIONS" | jq -R -s -c 'split("\n") | map(select(. != "" and . != null))')
+          echo "Detected solutions: $SOLUTION_ARRAY"
+          echo "has-changes=true" >> $GITHUB_OUTPUT
+          echo "solutions=$SOLUTION_ARRAY" >> $GITHUB_OUTPUT
+
+  # Job 2: Pack Solution Artifacts (from packing-artifact.yml)
+  pack-artifacts:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    needs: [detect-changes]
+    if: |
+      always() && (
+        (github.event_name == 'push' && needs.detect-changes.outputs.has-changes == 'true') ||
+        github.event_name == 'workflow_dispatch'
+      )
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        solution-name: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', github.event.inputs.solution-name)) || fromJson(needs.detect-changes.outputs.solutions || '[]') }}
+
+    outputs:
+      solution-name: ${{ matrix.solution-name }}
+      solution-version: ${{ steps.version.outputs.new-version }}
+      artifact-path: ${{ steps.store-artifact.outputs.artifact-path }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install PAC CLI as .NET Global Tool
+        run: |
+          dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+        shell: powershell
+
+      - name: Add dotnet tools path to PATH
+        run: |
+          echo "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: powershell
+
+      - name: Install Power Platform CLI
+        uses: microsoft/powerplatform-actions/actions-install@v1
+
+      - name: Validate solution exists
+        shell: powershell
+        run: |
+          $solutionName = "${{ matrix.solution-name }}"
+          $solutionPath = "src/solutions/$solutionName"
+          if (!(Test-Path $solutionPath)) {
+            Write-Error "Solution not found: $solutionPath"
+            exit 1
+          }
+          Write-Host "✅ Solution validated: $solutionName" -ForegroundColor Green
+
+      - name: Get solution version from XML
+        id: version
+        shell: powershell
+        run: |
+          $solutionName = "${{ matrix.solution-name }}"
+
+          # Find the correct XML file (prioritize PAC CLI structure when available)
+          $solutionXmlPath = "src/solutions/$solutionName/solution.xml"
+          $alternateXmlPath = "src/solutions/$solutionName/Solution.xml"
+          $pacCliXmlPath = "src/solutions/$solutionName/Other/Solution.xml"
+
+          $xmlPath = $null
+          if (Test-Path $pacCliXmlPath) {
+            $xmlPath = $pacCliXmlPath
+          } elseif (Test-Path $solutionXmlPath) {
+            $xmlPath = $solutionXmlPath
+          } elseif (Test-Path $alternateXmlPath) {
+            $xmlPath = $alternateXmlPath
+          }
+
+          if (-not $xmlPath) {
+            Write-Error "No solution.xml found for $solutionName"
+            exit 1
+          }
+
+          Write-Host "=== READING SOLUTION VERSION ===" -ForegroundColor Cyan
+          Write-Host "Solution: $solutionName" -ForegroundColor White
+          Write-Host "XML Path: $xmlPath" -ForegroundColor White
+
+          # Read current version from XML
+          [xml]$xml = Get-Content $xmlPath
+          $currentVersion = "1.0.0.0"  # Default fallback version
+
+          if ($xml.ImportExportXml.SolutionManifest.Version) {
+            $currentVersion = $xml.ImportExportXml.SolutionManifest.Version
+          } elseif ($xml.solution.version) {
+            $currentVersion = $xml.solution.version
+          }
+
+          Write-Host "✅ Current solution version: $currentVersion" -ForegroundColor Green
+          echo "new-version=$currentVersion" >> $env:GITHUB_OUTPUT
+          echo "solution-xml-path=$xmlPath" >> $env:GITHUB_OUTPUT
+
+      - name: Set solution as managed
+        shell: powershell
+        run: |
+          $xmlPath = "${{ steps.version.outputs.solution-xml-path }}"
+          Write-Host "=== Setting solution as MANAGED ===" -ForegroundColor Cyan
+          [xml]$xml = Get-Content $xmlPath
+          if ($xml.ImportExportXml.SolutionManifest.Managed) {
+            $xml.ImportExportXml.SolutionManifest.Managed = "1"
+            $xml.Save($xmlPath)
+            Write-Host "✅ Solution marked as MANAGED" -ForegroundColor Green
+          }
+
+      - name: Create testing directory
+        shell: powershell
+        run: |
+          if (!(Test-Path "testing")) {
+            New-Item -ItemType Directory -Path "testing" -Force | Out-Null
+          }
+
+      - name: Pack solution as managed using PAC CLI
+        id: pack
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $solutionName = "${{ matrix.solution-name }}"
+          $newVersion = "${{ steps.version.outputs.new-version }}"
+          $solutionPath = "src/solutions/$solutionName"
+          $managedZipPath = "testing/${solutionName}_${newVersion}_managed.zip"
+          
+          Write-Host "=== PACKING SOLUTION AS MANAGED ===" -ForegroundColor Cyan
+          Write-Host "Solution: $solutionName v$newVersion" -ForegroundColor White
+          
+          # Remove existing file if present
+          if (Test-Path $managedZipPath) {
+            Remove-Item $managedZipPath -Force
+          }
+          
+          # Pack solution with retry logic
+          $maxRetries = 2
+          $packSuccess = $false
+          for ($i = 1; $i -le $maxRetries; $i++) {
+              try {
+                  $packResult = & pac solution pack --zipfile $managedZipPath --folder $solutionPath --packagetype Managed 2>&1
+                  if ($LASTEXITCODE -eq 0) {
+                      $packSuccess = $true
+                      break
+                  }
+              }
+              catch {
+                  Write-Host "Pack attempt $i failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                  if ($i -lt $maxRetries) {
+                      Start-Sleep -Seconds 30
+                  }
+              }
+          }
+          
+          if (-not $packSuccess -or !(Test-Path $managedZipPath)) {
+            Write-Error "Failed to pack solution after $maxRetries attempts"
+            exit 1
+          }
+          
+          $fileSize = [math]::Round((Get-Item $managedZipPath).Length / 1KB, 2)
+          Write-Host "✅ Managed solution packed successfully! Size: $fileSize KB" -ForegroundColor Green
+          echo "managed-zip-path=$managedZipPath" >> $env:GITHUB_OUTPUT
+
+      - name: Store managed solution in artifact folder
+        id: store-artifact
+        shell: powershell
+        run: |
+          $solutionName = "${{ matrix.solution-name }}"
+          $newVersion = "${{ steps.version.outputs.new-version }}"
+          $managedZipPath = "${{ steps.pack.outputs.managed-zip-path }}"
+          
+          Write-Host "=== STORING IN ARTIFACT FOLDER ===" -ForegroundColor Cyan
+          
+          # Create artifact directory structure
+          $artifactDir = "artifact/managed-solutions/$solutionName"
+          if (!(Test-Path $artifactDir)) {
+            New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          }
+          
+          # Copy managed solution to artifact folder with version
+          $artifactZipPath = "$artifactDir/${solutionName}_${newVersion}_managed.zip"
+          Copy-Item $managedZipPath $artifactZipPath -Force
+          
+          if (Test-Path $artifactZipPath) {
+            $fileSize = [math]::Round((Get-Item $artifactZipPath).Length / 1KB, 2)
+            Write-Host "✅ Artifact stored: $artifactZipPath ($fileSize KB)" -ForegroundColor Green
+            echo "artifact-path=$artifactZipPath" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Error "Failed to copy managed solution to artifact folder"
+            exit 1
+          }
+
+      - name: Upload solution artifact for deployment jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: solution-${{ matrix.solution-name }}-${{ steps.version.outputs.new-version }}
+          path: ${{ steps.pack.outputs.managed-zip-path }}
+          retention-days: 7
+
+  # Job 3: Deploy to CICD Environment (from deploy-to-cicd-artifact.yml)
+  deploy-to-cicd:
+    runs-on: windows-latest
+    needs: [pack-artifacts]
+    if: success()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Download solution artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: solution-${{ needs.pack-artifacts.outputs.solution-name }}-${{ needs.pack-artifacts.outputs.solution-version }}
+          path: ./downloaded-artifacts
+
+      - name: Use artifact from packing job
+        id: get-artifact
+        shell: pwsh
+        run: |
+          $solutionName = "${{ needs.pack-artifacts.outputs.solution-name }}"
+          $solutionVersion = "${{ needs.pack-artifacts.outputs.solution-version }}"
+          
+          Write-Host "=== USING DOWNLOADED ARTIFACT FOR CICD DEPLOYMENT ===" -ForegroundColor Cyan
+          Write-Host "Solution: $solutionName v$solutionVersion" -ForegroundColor White
+          
+          # Find the downloaded artifact file
+          $artifactFile = Get-ChildItem -Path "./downloaded-artifacts" -Filter "${solutionName}_${solutionVersion}_managed.zip" -Recurse | Select-Object -First 1
+          
+          if (-not $artifactFile) {
+            Write-Error "Downloaded artifact not found: ${solutionName}_${solutionVersion}_managed.zip"
+            exit 1
+          }
+          
+          $artifactPath = $artifactFile.FullName
+          Write-Host "Artifact Path: $artifactPath" -ForegroundColor White
+          Write-Host "✅ Using downloaded artifact: $($artifactFile.Name)" -ForegroundColor Green
+          echo "artifact-path=$artifactPath" >> $env:GITHUB_OUTPUT
+          echo "artifact-name=$($artifactFile.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Create output directory
+        shell: pwsh
+        run: |
+          if (!(Test-Path "out")) {
+            New-Item -ItemType Directory -Path "out"
+          }
+
+      - name: Copy artifact to output directory
+        shell: pwsh
+        run: |
+          $sourcePath = "${{ steps.get-artifact.outputs.artifact-path }}"
+          $targetPath = "out/${{ needs.pack-artifacts.outputs.solution-name }}_managed.zip"
+          Copy-Item -Path $sourcePath -Destination $targetPath -Force
+          Write-Host "✅ Copied artifact to: $targetPath" -ForegroundColor Green
+
+      - name: Install Power Platform CLI
+        uses: microsoft/powerplatform-actions/actions-install@v1
+
+      - name: Import to CICD environment
+        uses: microsoft/powerplatform-actions/import-solution@v1
+        with:
+          environment-url: ${{ secrets.ENVIRONMENT_URL_CICD }}
+          app-id: ${{ secrets.CLIENT_ID_CICD }}
+          client-secret: ${{ secrets.CLIENT_SECRET_CICD }}
+          tenant-id: ${{ secrets.TENANT_ID_CICD }}
+          solution-file: out/${{ needs.pack-artifacts.outputs.solution-name }}_managed.zip
+          force-overwrite: true
+          publish-changes: true
+          run-asynchronously: true
+          max-async-wait-time: 60
+
+      - name: CICD deployment success notification
+        shell: bash
+        run: |
+          echo "✅ Successfully deployed ${{ needs.pack-artifacts.outputs.solution-name }} to CICD environment"
+
+  # Job 4: Deploy to TEST Environment (from deploy-to-test-artifact.yml)
+  deploy-to-test:
+    runs-on: windows-latest
+    needs: [pack-artifacts, deploy-to-cicd]
+    if: success()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Download solution artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: solution-${{ needs.pack-artifacts.outputs.solution-name }}-${{ needs.pack-artifacts.outputs.solution-version }}
+          path: ./downloaded-artifacts
+
+      - name: Use artifact from packing job
+        id: get-artifact
+        shell: pwsh
+        run: |
+          $solutionName = "${{ needs.pack-artifacts.outputs.solution-name }}"
+          $solutionVersion = "${{ needs.pack-artifacts.outputs.solution-version }}"
+          
+          Write-Host "=== USING DOWNLOADED ARTIFACT FOR TEST DEPLOYMENT ===" -ForegroundColor Cyan
+          Write-Host "Solution: $solutionName v$solutionVersion" -ForegroundColor White
+          
+          # Find the downloaded artifact file
+          $artifactFile = Get-ChildItem -Path "./downloaded-artifacts" -Filter "${solutionName}_${solutionVersion}_managed.zip" -Recurse | Select-Object -First 1
+          
+          if (-not $artifactFile) {
+            Write-Error "Downloaded artifact not found: ${solutionName}_${solutionVersion}_managed.zip"
+            exit 1
+          }
+          
+          $artifactPath = $artifactFile.FullName
+          Write-Host "Artifact Path: $artifactPath" -ForegroundColor White
+          Write-Host "✅ Using downloaded artifact: $($artifactFile.Name)" -ForegroundColor Green
+          echo "artifact-path=$artifactPath" >> $env:GITHUB_OUTPUT
+          echo "artifact-name=$($artifactFile.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Create output directory
+        shell: pwsh
+        run: |
+          if (!(Test-Path "out")) {
+            New-Item -ItemType Directory -Path "out"
+          }
+
+      - name: Copy artifact to output directory
+        shell: pwsh
+        run: |
+          $sourcePath = "${{ steps.get-artifact.outputs.artifact-path }}"
+          $targetPath = "out/${{ needs.pack-artifacts.outputs.solution-name }}_managed.zip"
+          Copy-Item -Path $sourcePath -Destination $targetPath -Force
+          Write-Host "✅ Copied artifact to: $targetPath" -ForegroundColor Green
+
+      - name: Install Power Platform CLI
+        uses: microsoft/powerplatform-actions/actions-install@v1
+
+      - name: Import to TEST environment
+        uses: microsoft/powerplatform-actions/import-solution@v1
+        with:
+          environment-url: ${{ secrets.ENVIRONMENT_URL_TEST }}
+          app-id: ${{ secrets.CLIENT_ID_TEST }}
+          client-secret: ${{ secrets.CLIENT_SECRET_TEST }}
+          tenant-id: ${{ secrets.TENANT_ID_TEST }}
+          solution-file: out/${{ needs.pack-artifacts.outputs.solution-name }}_managed.zip
+          force-overwrite: true
+          publish-changes: true
+          run-asynchronously: true
+          max-async-wait-time: 60
+
+      - name: Update Environment Variables
+        id: update-env-vars
+        shell: powershell
+        run: |
+          Write-Host "=== UPDATING ENVIRONMENT VARIABLES ===" -ForegroundColor Cyan
+
+          # Verify the PowerShell script exists
+          $scriptPath = "scripts/Update-EnvironmentVariables-CDS.ps1"
+          if (!(Test-Path $scriptPath)) {
+            Write-Error "Environment variables script not found: $scriptPath"
+            exit 1
+          }
+
+          Write-Host "Using environment variables script: $scriptPath" -ForegroundColor White
+          Write-Host "Target Environment: TEST" -ForegroundColor White
+
+          # Execute the script with GitHub secrets
+          try {
+            & powershell.exe -ExecutionPolicy Bypass -File $scriptPath `
+              -EnvironmentUrl "${{ secrets.ENVIRONMENT_URL_TEST }}" `
+              -ClientId "${{ secrets.CLIENT_ID_TEST }}" `
+              -ClientSecret "${{ secrets.CLIENT_SECRET_TEST }}" `
+              -TenantId "${{ secrets.TENANT_ID_TEST }}"
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ Environment variables updated successfully!" -ForegroundColor Green
+            } else {
+              Write-Error "Environment variables update failed with exit code: $LASTEXITCODE"
+              exit 1
+            }
+          }
+          catch {
+            Write-Error "Failed to execute environment variables update: $($_.Exception.Message)"
+            exit 1
+          }
+
+      - name: TEST deployment success notification
+        shell: bash
+        run: |
+          echo "✅ Successfully deployed ${{ needs.pack-artifacts.outputs.solution-name }} to TEST environment"
+
+  # Job 5: Commit artifacts and send final notification
+  finalize-pipeline:
+    runs-on: ubuntu-latest
+    needs: [pack-artifacts, deploy-to-cicd, deploy-to-test]
+    if: always() && needs.pack-artifacts.result == 'success'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download solution artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: solution-${{ needs.pack-artifacts.outputs.solution-name }}-${{ needs.pack-artifacts.outputs.solution-version }}
+          path: ./downloaded-artifacts
+
+      - name: Recreate artifact folder structure and copy files
+        shell: bash
+        run: |
+          SOLUTION_NAME="${{ needs.pack-artifacts.outputs.solution-name }}"
+          SOLUTION_VERSION="${{ needs.pack-artifacts.outputs.solution-version }}"
+          
+          echo "=== RECREATING ARTIFACT FOLDER STRUCTURE ==="
+          echo "Solution: $SOLUTION_NAME v$SOLUTION_VERSION"
+          
+          # Create the artifact directory structure
+          mkdir -p "artifact/managed-solutions/$SOLUTION_NAME"
+          
+          # Find and copy the downloaded artifact
+          ARTIFACT_FILE=$(find ./downloaded-artifacts -name "${SOLUTION_NAME}_${SOLUTION_VERSION}_managed.zip" -type f | head -1)
+          
+          if [ -n "$ARTIFACT_FILE" ] && [ -f "$ARTIFACT_FILE" ]; then
+            TARGET_PATH="artifact/managed-solutions/$SOLUTION_NAME/${SOLUTION_NAME}_${SOLUTION_VERSION}_managed.zip"
+            cp "$ARTIFACT_FILE" "$TARGET_PATH"
+            echo "✅ Copied artifact to: $TARGET_PATH"
+            ls -la "$TARGET_PATH"
+          else
+            echo "❌ Downloaded artifact not found: ${SOLUTION_NAME}_${SOLUTION_VERSION}_managed.zip"
+            exit 1
+          fi
+
+      - name: Commit packed artifacts
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: |
+            src/solutions/${{ needs.pack-artifacts.outputs.solution-name }}
+            artifact/managed-solutions/${{ needs.pack-artifacts.outputs.solution-name }}
+          default_author: github_actions
+          message: |
+            Auto-Pipeline: ${{ needs.pack-artifacts.outputs.solution-name }} v${{ needs.pack-artifacts.outputs.solution-version }}
+
+            - ✅ Packed managed solution artifact
+            - ✅ Deployed to CICD: ${{ needs.deploy-to-cicd.result }}
+            - ✅ Deployed to TEST: ${{ needs.deploy-to-test.result }}
+            - Trigger: ${{ github.event_name }}
+          push: true
+
+      - name: Send comprehensive Teams notification
+        if: always()
+        shell: bash
+        run: |
+          # Determine overall pipeline status
+          PACK_STATUS="${{ needs.pack-artifacts.result }}"
+          CICD_STATUS="${{ needs.deploy-to-cicd.result }}"
+          TEST_STATUS="${{ needs.deploy-to-test.result }}"
+          
+          # Set overall status and color
+          if [ "$PACK_STATUS" == "success" ] && [ "$CICD_STATUS" == "success" ] && [ "$TEST_STATUS" == "success" ]; then
+            OVERALL_STATUS="✅ Pipeline Success"
+            THEME_COLOR="00FF00"
+          else
+            OVERALL_STATUS="❌ Pipeline Failed"
+            THEME_COLOR="FF0000"
+          fi
+          
+          # Get solution info
+          SOLUTION_NAME="${{ needs.pack-artifacts.outputs.solution-name }}"
+          SOLUTION_VERSION="${{ needs.pack-artifacts.outputs.solution-version }}"
+          TRIGGER_TYPE="Manual"
+          if [ "${{ github.event_name }}" == "push" ]; then
+            TRIGGER_TYPE="Automatic (Code Changes)"
+          fi
+          
+          # Create comprehensive Teams message
+          MESSAGE="{
+            \"@type\": \"MessageCard\",
+            \"@context\": \"http://schema.org/extensions\",
+            \"summary\": \"Complete Solution Pipeline Status\",
+            \"themeColor\": \"$THEME_COLOR\",
+            \"title\": \"$OVERALL_STATUS\",
+            \"sections\": [{
+              \"activityTitle\": \"Complete Solution Pipeline: **$SOLUTION_NAME** v**$SOLUTION_VERSION**\",
+              \"facts\": [
+                {\"name\": \"📦 Pack Artifacts\", \"value\": \"✅ Success\"},
+                {\"name\": \"🚀 Deploy CICD\", \"value\": \"$([ \"$CICD_STATUS\" == \"success\" ] && echo \"✅ Success\" || echo \"❌ Failed\")\"},
+                {\"name\": \"🚀 Deploy TEST\", \"value\": \"$([ \"$TEST_STATUS\" == \"success\" ] && echo \"✅ Success\" || echo \"❌ Failed\")\"},
+                {\"name\": \"Trigger Type\", \"value\": \"$TRIGGER_TYPE\"},
+                {\"name\": \"Executed By\", \"value\": \"${{ github.actor }}\"},
+                {\"name\": \"Repository\", \"value\": \"${{ github.repository }}\"},
+                {\"name\": \"Workflow\", \"value\": \"Complete Solution Pipeline\"}
+              ],
+              \"markdown\": true
+            }]
+          }"
+          
+          # Send notification if webhook is configured
+          if [ -n "${{ secrets.TEAMS_CHANNEL_WEBHOOK }}" ]; then
+            echo "Sending comprehensive pipeline notification for: $SOLUTION_NAME"
+            curl -H "Content-Type: application/json" -d "$MESSAGE" "${{ secrets.TEAMS_CHANNEL_WEBHOOK }}" || echo "Teams notification failed"
+          else
+            echo "Teams webhook not configured, skipping notification"
+          fi
